@@ -1,0 +1,36 @@
+name: Earthquake alerts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay runs a little at busy times)
+  workflow_dispatch: {}      # lets you press "Run workflow" by hand
+
+permissions:
+  contents: write            # needed to save ledger.txt (the "already alerted" list)
+
+concurrency:
+  group: quake-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check sources and send alerts
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: python3 quake_poller.py --once --ledger ledger.txt
+
+      - name: Save the already-alerted list
+        if: always()
+        run: |
+          if ! git diff --quiet ledger.txt; then
+            git config user.name "quake-alert-bot"
+            git config user.email "quake-alert-bot@users.noreply.github.com"
+            git add ledger.txt
+            git commit -m "Update quake alert ledger"
+            git push
+          fi
