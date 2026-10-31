@@ -1,8 +1,8 @@
-name: Earthquake alerts
+name: Earthquake, tsunami and volcano alerts
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay runs a little at busy times)
+    - cron: "2-59/5 * * * *"  # every 5 minutes at :02, :07, :12... (avoids busy round minutes)
   workflow_dispatch: {}      # lets you press "Run workflow" by hand
 
 permissions:
