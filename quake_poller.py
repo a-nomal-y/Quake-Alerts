@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Earthquake poller: USGS, GFZ, JMA, BMKG, AFAD. Stdlib only. GitHub Actions edition.
-
+"""Earthquake, tsunami and volcano poller. Quakes: USGS, GFZ, JMA, BMKG, AFAD. Tsunami: PTWC/NTWC, JMA, BMKG.
+Volcano: aviation ash SIGMETs, GDACS, MAGMA Indonesia, GeoNet NZ. Stdlib only. GitHub Actions edition.
 Run once per schedule tick: python3 quake_poller.py --once --ledger ledger.txt
 The Slack workflow webhook is read from the SLACK_WEBHOOK environment variable (a GitHub secret).
 
@@ -317,6 +317,194 @@ def post_webhook(url, text):
         return r.status == 200
 
 
+# ---------------- tsunami and volcano sources (independent alerts) ----------------
+# each hazard item: key (unique, no spaces), text (alert message), group (seed group or None)
+ASH_MIN_FT = 25000          # ash cloud top at/above this (FL250) = flight-disrupting eruption
+TSUNAMI_MAX_AGE_H = 12
+JMA_TSU_LEVELS = [("大津波警報", "Major tsunami warning"), ("津波警報", "Tsunami warning"), ("津波注意報", "Tsunami advisory")]
+
+
+def _xml_text(block, tag):
+    m = re.search(r"<%s[^>]*>(.*?)</%s>" % (tag, tag), block, re.S)
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+
+
+def hz_ptwc(now):
+    out = []
+    for feed, centre in (("PHEB", "Pacific Tsunami Warning Center"), ("PAAQ", "US National Tsunami Warning Center")):
+        xml = get("https://www.tsunami.gov/events/xml/%sAtom.xml" % feed)
+        for ent in re.findall(r"<entry>(.*?)</entry>", xml, re.S):
+            summ = re.sub(r"<[^>]+>", " ", _xml_text(ent, "summary"))
+            cat = re.search(r"Category:\s*([A-Za-z ]+?)\s+Bulletin", summ)
+            cat = cat.group(1).strip() if cat else ""
+            upd = _xml_text(ent, "updated")
+            try:
+                t = datetime.fromisoformat(upd.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if not cat or cat.lower() == "information" or now - t > timedelta(hours=TSUNAMI_MAX_AGE_H):
+                continue
+            mag = re.search(r"Preliminary Magnitude:\s*([\d.]+)", summ)
+            link = re.search(r'title="Bulletin" href="([^"]+)"', ent)
+            region = _xml_text(ent, "title")
+            text = "\n".join([
+                "TSUNAMI ALERT: %s issued by the %s" % (cat, centre),
+                "Region: " + region.title(),
+                "Issued: " + fmt_time(t),
+                "Preliminary quake magnitude: " + (mag.group(1) if mag else "n/a"),
+                "Bulletin: " + (link.group(1) if link else "https://www.tsunami.gov/")])
+            # one alert per region, category and day: hourly update bulletins and the twin US centre do not repeat it
+            out.append(dict(key="tsu-us-%s-%s-%s" % (re.sub(r"[^a-z0-9]+", "-", region.lower()).strip("-"),
+                                                     cat.lower().replace(" ", "-"), t.strftime("%Y%m%d")), text=text, group=None))
+    return out
+
+
+def hz_jma_tsunami(now):
+    out = []
+    for r in json.loads(get("https://www.jma.go.jp/bosai/tsunami/data/list.json")):
+        try:
+            t = datetime.fromisoformat(r["rdt"]).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if now - t > timedelta(hours=TSUNAMI_MAX_AGE_H) or r.get("ift") != "発表":
+            continue
+        kinds = [k.get("kind", "") for k in r.get("kind", [])]
+        level = next((en for jp, en in JMA_TSU_LEVELS if any(jp in k and "解除" not in k for k in kinds)), None)
+        if not level:
+            continue
+        text = "\n".join([
+            "TSUNAMI ALERT: Japan %s (JMA)" % level,
+            "Quake: %s, M%s" % (r.get("en_anm") or r.get("anm") or "location n/a", r.get("mag") or "n/a"),
+            "Issued: " + fmt_time(t),
+            "Details: https://www.jma.go.jp/bosai/map.html#contents=tsunami"])
+        out.append(dict(key="tsu-jma-%s-%s" % (r.get("eid"), level.replace(" ", "-").lower()), text=text, group=None))
+    return out
+
+
+def hz_bmkg_tsunami(now):
+    out, seen = [], set()
+    for u in ("https://data.bmkg.go.id/DataMKG/TEWS/autogempa.json",
+              "https://data.bmkg.go.id/DataMKG/TEWS/gempaterkini.json"):
+        g = json.loads(get(u))["Infogempa"]["gempa"]
+        for e in (g if isinstance(g, list) else [g]):
+            pot = (e.get("Potensi") or "").lower()
+            if "berpotensi tsunami" not in pot or "tidak berpotensi" in pot or e["DateTime"] in seen:
+                continue
+            seen.add(e["DateTime"])
+            t = datetime.fromisoformat(e["DateTime"]).astimezone(timezone.utc)
+            if now - t > timedelta(hours=TSUNAMI_MAX_AGE_H):
+                continue
+            text = "\n".join([
+                "TSUNAMI ALERT: Indonesia's BMKG says this quake has tsunami potential",
+                "Quake: M%s, %s, depth %s" % (e.get("Magnitude"), e.get("Wilayah"), e.get("Kedalaman")),
+                "Time: " + fmt_time(t),
+                "BMKG note: " + (e.get("Potensi") or ""),
+                "Details: https://www.bmkg.go.id/"])
+            out.append(dict(key="tsu-bmkg-" + t.strftime("%Y%m%d%H%M%S"), text=text, group=None))
+    return out
+
+
+def hz_ash_sigmet(now):
+    out = []
+    for x in json.loads(get("https://aviationweather.gov/api/data/isigmet?format=json&hazard=va")):
+        raw = (x.get("rawSigmet") or "").replace("\n", " ")
+        top = x.get("top") or max([int(f) * 100 for f in re.findall(r"FL(\d{3})", raw)] or [0])
+        if not top or top < ASH_MIN_FT:
+            continue
+        m = re.search(r"VA(?:\s+ERUPTION)?\s+(?:MT\s+|VOLCAN\s+)?(.+?)\s+PSN", raw)
+        name = re.sub(r"\s+", " ", m.group(1)).strip().title() if m else "Unnamed volcano"
+        fir = (x.get("firName") or x.get("firId") or "").strip()
+        vf = datetime.fromtimestamp(x["validTimeFrom"], timezone.utc) if x.get("validTimeFrom") else now
+        vt = datetime.fromtimestamp(x["validTimeTo"], timezone.utc) if x.get("validTimeTo") else None
+        text = "\n".join([
+            "VOLCANO ALERT: %s, ash cloud up to FL%03d (about %.0f km)" % (name, top // 100, top * 0.0003048),
+            "Aviation ash warning (SIGMET) for %s airspace, valid %s%s" % (
+                fir, vf.strftime("%d %b %H:%M UTC"), (" to " + vt.strftime("%H:%M UTC")) if vt else ""),
+            "Why alerted: ash at or above FL250 usually disrupts flights",
+            "Source: https://aviationweather.gov/gfa/#sigmet"])
+        out.append(dict(key="ash-%s-%s" % (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-"), vf.strftime("%Y%m%d")),
+                        text=text, group=None))
+    return out
+
+
+def hz_gdacs_volcano(now):
+    out = []
+    d = json.loads(get("https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH?eventlist=VO"))
+    for f in d.get("features", []):
+        p = f["properties"]
+        lvl = (p.get("alertlevel") or "").capitalize()
+        try:
+            mod = datetime.fromisoformat(p.get("datemodified")[:19]).replace(tzinfo=timezone.utc)
+            frm = datetime.fromisoformat(p.get("fromdate")[:19]).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if lvl not in ("Orange", "Red") or now - mod > timedelta(days=3) or now - frm > timedelta(days=7):
+            continue
+        text = "\n".join([
+            "VOLCANO ALERT: %s eruption alert, %s, %s (GDACS)" % (lvl, p.get("eventname"), p.get("country")),
+            "Eruption reported: " + fmt_time(frm),
+            "Report: " + ((p.get("url") or {}).get("report") or "https://www.gdacs.org/")])
+        out.append(dict(key="gdacs-vo-%s-%s-%s" % (p.get("eventid"), p.get("episodeid"), lvl.lower()), text=text, group=None))
+    return out
+
+
+def hz_magma_levels(now):
+    html_ = get("https://magma.esdm.go.id/v1/gunung-api/tingkat-aktivitas")
+    out = []
+    marks = [("Level IV (Awas)</a>", "Level IV (Awas, highest)", "4"), ("Level III (Siaga)</a>", "Level III (Siaga)", "3"),
+             ("Level II (Waspada)</a>", None, None)]
+    pos = [html_.find(m[0]) for m in marks]
+    if min(pos) < 0:
+        raise ValueError("MAGMA page layout changed")
+    for i in range(2):
+        seg = html_[pos[i]:pos[i + 1]]
+        for name, link in re.findall(r"<td>\s*([^<]+?)\s*<a href=\"([^\"]*laporan[^\"]*)\"", seg):
+            name = re.sub(r"\s+", " ", name).strip()
+            vol = name.split(" - ")[0].strip()
+            text = "\n".join([
+                "VOLCANO ALERT: %s (Indonesia) is at %s" % (name, marks[i][1]),
+                "Set by Indonesia's volcano agency PVMBG (MAGMA Indonesia); Level III means danger zones are expanded, Level IV means evacuation",
+                "Report: " + link.split("?")[0]])
+            out.append(dict(key="magma-%s-l%s-%s" % (re.sub(r"[^a-z0-9]+", "-", vol.lower()).strip("-"), marks[i][2], now.year),
+                            text=text, group="magma"))
+    return out
+
+
+def hz_geonet_val(now):
+    out = []
+    for f in json.loads(get("https://api.geonet.org.nz/volcano/val"))["features"]:
+        p = f["properties"]
+        if int(p.get("level", 0)) < 3:
+            continue
+        text = "\n".join([
+            "VOLCANO ALERT: %s (New Zealand) at Volcanic Alert Level %s: %s" % (p.get("volcanoTitle"), p.get("level"), p.get("activity")),
+            "Hazards: " + (p.get("hazards") or "n/a"),
+            "Source: https://www.geonet.org.nz/volcano"])
+        out.append(dict(key="geonet-%s-l%s-%s" % (p.get("volcanoID"), p.get("level"), now.year), text=text, group="geonet"))
+    return out
+
+
+HAZARD_SOURCES = [("PTWC/NTWC", hz_ptwc), ("JMA-tsunami", hz_jma_tsunami), ("BMKG-tsunami", hz_bmkg_tsunami),
+                  ("Ash-SIGMET", hz_ash_sigmet), ("GDACS-volcano", hz_gdacs_volcano),
+                  ("MAGMA-Indonesia", hz_magma_levels), ("GeoNet-NZ", hz_geonet_val)]
+
+
+def load_hz_keys(path):
+    keys = set()
+    try:
+        for line in open(path, encoding="utf-8").read().splitlines():
+            m = re.search(r"Ref:\s*HZ\s+(\S+)", line.replace("\\", ""))
+            if m:
+                keys.add(m.group(1))
+    except FileNotFoundError:
+        pass
+    return keys
+
+
+def hz_ref(key, now):
+    return "Ref: HZ %s | %s" % (key, now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
 # ---------------- main loop ----------------
 
 def poll_once(now, ledger, webhook, ledger_path):
@@ -356,6 +544,49 @@ def poll_once(now, ledger, webhook, ledger_path):
         if not sent:
             act["fallback_text"] = text
         actions.append(act)
+
+    # tsunami and volcano alerts
+    hz_keys = load_hz_keys(ledger_path)
+    for name, fn in HAZARD_SOURCES:
+        try:
+            items = fn(now)
+            health[name] = "ok(%d)" % len(items)
+        except Exception as ex:
+            health[name] = "error: " + type(ex).__name__
+            continue
+        groups = set(i["group"] for i in items if i["group"])
+        for grp in groups:           # first time we see a seeded source: record what is already active, silently
+            if "seed-" + grp not in hz_keys:
+                for i in items:
+                    if i["group"] == grp and i["key"] not in hz_keys:
+                        hz_keys.add(i["key"])
+                        line = hz_ref(i["key"], now)
+                        with open(ledger_path, "a", encoding="utf-8") as f:
+                            f.write("local-%d-s %s\n" % (time.time() * 1000, line))
+                        actions.append(dict(action="log_to_canvas", kind="seed", webhook_sent=True, silent=True, line=line))
+                hz_keys.add("seed-" + grp)
+                line = hz_ref("seed-" + grp, now)
+                with open(ledger_path, "a", encoding="utf-8") as f:
+                    f.write("local-%d-s %s\n" % (time.time() * 1000, line))
+                actions.append(dict(action="log_to_canvas", kind="seed", webhook_sent=True, silent=True, line=line))
+        for i in items:
+            if i["key"] in hz_keys:
+                continue
+            sent = False
+            if webhook:
+                try:
+                    sent = post_webhook(webhook, i["text"])
+                except Exception:
+                    sent = False
+            line = hz_ref(i["key"], now)
+            hz_keys.add(i["key"])
+            if sent or not webhook:
+                with open(ledger_path, "a", encoding="utf-8") as f:
+                    f.write("local-%d-h %s\n" % (time.time() * 1000, line))
+            act = dict(action="log_to_canvas", kind="hazard", webhook_sent=sent, line=line)
+            if not sent:
+                act["fallback_text"] = i["text"]
+            actions.append(act)
     return actions, health
 
 
