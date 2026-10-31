@@ -1,1 +1,7 @@
 seed-1 Ref: 2026-10-09T17:56:06Z | 7.59,-80.77 | PAGER orange | ids us6000u18k
+local-1793483927493-s Ref: HZ magma-anak-krakatau-l3-2026 | 2026-10-31T21:58:36Z
+local-1793483927493-s Ref: HZ magma-merapi-l3-2026 | 2026-10-31T21:58:36Z
+local-1793483927493-s Ref: HZ magma-semeru-l3-2026 | 2026-10-31T21:58:36Z
+local-1793483927493-s Ref: HZ seed-magma | 2026-10-31T21:58:36Z
+local-1793483927684-s Ref: HZ geonet-whiteisland-l3-2026 | 2026-10-31T21:58:36Z
+local-1793483927684-s Ref: HZ seed-geonet | 2026-10-31T21:58:36Z
