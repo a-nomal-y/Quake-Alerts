@@ -5,3 +5,4 @@ local-1793483927493-s Ref: HZ magma-semeru-l3-2026 | 2026-10-31T21:58:36Z
 local-1793483927493-s Ref: HZ seed-magma | 2026-10-31T21:58:36Z
 local-1793483927684-s Ref: HZ geonet-whiteisland-l3-2026 | 2026-10-31T21:58:36Z
 local-1793483927684-s Ref: HZ seed-geonet | 2026-10-31T21:58:36Z
+local-1793758437199-h Ref: HZ ash-sheveluch-20261104 | 2026-11-04T02:13:52Z
